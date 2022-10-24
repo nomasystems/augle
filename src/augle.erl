@@ -29,6 +29,7 @@
         default |
         {file, file:filename_all()} |
         {file, file:filename_all(), scopes()} |
+        {json, unicode:unicode_binary(), scopes()} |
         {metadata, unicode:unicode_binary()}.
 
 -define(AUTH_HEADERS(AccessToken), [{<<"Authorization">>, <<"Bearer ", AccessToken/binary>>}]).
@@ -55,6 +56,8 @@ new_creds_from({file, Path}) ->
     augle_gcloud_sdk:creds_from_file(Path, <<>>);
 new_creds_from({file, Path, Scopes}) ->
     augle_gcloud_sdk:creds_from_file(Path, Scopes);
+new_creds_from({json, Creds, Scopes}) ->
+    augle_gcloud_sdk:creds_from_json(Creds, Scopes);
 new_creds_from({metadata, ServiceAccount}) ->
     augle_gcloud_sdk:metadata_fetch_token(ServiceAccount).
 

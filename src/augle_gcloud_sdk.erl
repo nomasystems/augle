@@ -10,6 +10,7 @@
 
 -export([app_default_credentials/2,
          creds_from_file/2,
+         creds_from_json/2,
          metadata_fetch_token/1,
          get_config_path/0]).
 
@@ -40,10 +41,15 @@ creds_from_file(Path, Scopes) when is_list(Scopes) ->
     creds_from_file(Path, CombinedScopes);
 creds_from_file(Path, Scopes) ->
     {ok, File} = file:read_file(Path),
-    #{project_id := _ProjectId,
-      client_email := Iss,
-      private_key := EncodedPrivateKey} = augle_utils:decode_json(File),
+    creds_from_map(augle_utils:decode_json(File), Scopes).
 
+creds_from_json(JsonCreds, Scopes) ->
+    creds_from_map(augle_utils:decode_json(JsonCreds), Scopes).
+
+creds_from_map(#{project_id := _ProjectId,
+                  client_email := Iss,
+                  private_key := EncodedPrivateKey},
+                Scopes) ->
     augle_jwt:access_token(Iss, Scopes, EncodedPrivateKey).
 
 default_path_or_metadata(ServiceAccount) ->
