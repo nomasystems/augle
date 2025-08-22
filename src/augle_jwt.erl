@@ -12,17 +12,15 @@
 
 -include_lib("public_key/include/public_key.hrl").
 
--define(HOST, "https://www.googleapis.com").
--define(TOKEN_PATH, "/oauth2/v4/token").
-
--define(AUD, <<"https://www.googleapis.com/oauth2/v4/token">>).
 -define(URLENCODED_CONTENT_TYPE, <<"application/x-www-form-urlencoded">>).
 -define(JWT_HEADER, [{alg, <<"RS256">>}, {typ, <<"JWT">>}]).
 
 access_token(Iss, Scopes, EncodedPrivateKey) ->
     Jwt = jwt(Iss, Scopes, EncodedPrivateKey),
     Uri = <<"grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=">>,
-    case hackney:post(<<?HOST, ?TOKEN_PATH>>,
+    AuthHost = augle_conf:auth_host(),
+    AuthPath = augle_conf:auth_path(),
+    case hackney:post(<<AuthHost/binary, AuthPath/binary>>,
                       [{<<"Content-Type">>, ?URLENCODED_CONTENT_TYPE}],
                       <<Uri/binary, Jwt/binary>>, []) of
         {ok, 200, _RespHeaders, Client} ->
@@ -55,9 +53,12 @@ asn1_decode(Der) ->
     Der.
 
 jwt_claim_set(Iss, Scopes) ->
+    AuthHost = augle_conf:auth_host(),
+    AuthPath = augle_conf:auth_path(),
+    Aud = <<AuthHost/binary, AuthPath/binary>>,
     [{iss, Iss},
      {scope, Scopes},
-     {aud, ?AUD},
+     {aud, Aud},
      {exp, calendar:datetime_to_gregorian_seconds(calendar:universal_time()) - 62167219200 + 3600},
      {iat, calendar:datetime_to_gregorian_seconds(calendar:universal_time()) - 62167219200}].
 
