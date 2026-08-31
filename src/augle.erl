@@ -16,7 +16,8 @@
 %% private?
 -export([new_creds_from/1]).
 
--export_types([creds/0]).
+-export_type([creds/0,
+              credentials_format/0]).
 
 -type creds() :: #{access_token := unicode:unicode_binary(),
                    expires_in   := integer(),

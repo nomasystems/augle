@@ -14,20 +14,20 @@
          metadata_fetch_token/1,
          get_config_path/0]).
 
--define(META_URL(ServiceAccount),
-        <<"http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/",
-          ServiceAccount/binary, "/token">>).
--define(META_HEADERS, [{<<"Metadata-Flavor">>, <<"Google">>}]).
+-define(META_HEADERS, [{<<"metadata-flavor">>, <<"Google">>}]).
 
 -define(CREDENTIALS_FILENAME, <<"application_default_credentials.json">>).
 
 -define(APP_CREDENTIALS, "GOOGLE_APPLICATION_CREDENTIALS").
 -define(CONFIG_DIR, "CLOUDSDK_CONFIG").
 
--define(TOKEN_ENDPOINT, <<"https://accounts.google.com/o/oauth2/token">>).
 -define(URLENCODED_CONTENT_TYPE, <<"application/x-www-form-urlencoded">>).
+-define(JWT_GRANT_TYPE, <<"urn:ietf:params:oauth:grant-type:jwt-bearer">>).
 -define(REFRESH_GRANT_TYPE, <<"refresh_token">>).
 
+%%%-----------------------------------------------------------------------------
+%%% FINDING CREDENTIALS
+%%%-----------------------------------------------------------------------------
 app_default_credentials(ServiceAccount, Scopes) ->
     case os:getenv(?APP_CREDENTIALS) of
         false ->
@@ -41,27 +41,27 @@ creds_from_file(Path, Scopes) when is_list(Scopes) ->
     creds_from_file(Path, CombinedScopes);
 creds_from_file(Path, Scopes) ->
     {ok, File} = file:read_file(Path),
-    creds_from_map(augle_utils:decode_json(File), Scopes).
+    creds_from_map(json:decode(File), Scopes).
 
 creds_from_json(JsonCreds, Scopes) ->
-    creds_from_map(augle_utils:decode_json(JsonCreds), Scopes).
+    creds_from_map(json:decode(JsonCreds), Scopes).
 
-creds_from_map(#{project_id := _ProjectId,
-                  client_email := Iss,
-                  private_key := EncodedPrivateKey},
-                Scopes) ->
-    augle_jwt:access_token(Iss, Scopes, EncodedPrivateKey).
+creds_from_map(#{<<"project_id">>   := _ProjectId,
+                 <<"client_email">> := Iss,
+                 <<"private_key">>  := EncodedPrivateKey},
+               Scopes) ->
+    jwt_bearer_grant(augle_jwt:assertion(Iss, Scopes, EncodedPrivateKey)).
 
 default_path_or_metadata(ServiceAccount) ->
-    ConfigPath = ?MODULE:get_config_path(),
+    ConfigPath = get_config_path(),
     CredentialsFile = filename:join(ConfigPath, ?CREDENTIALS_FILENAME),
     case file:read_file(CredentialsFile) of
         {ok, Content} ->
-            #{client_id := ClientId,
-              client_secret := ClientSecret ,
-              refresh_token := RefreshToken,
-              type := _Type} = augle_utils:decode_json(Content),
-            refresh_grant(?TOKEN_ENDPOINT, RefreshToken, ClientId, ClientSecret);
+            #{<<"client_id">>     := ClientId,
+              <<"client_secret">> := ClientSecret,
+              <<"refresh_token">> := RefreshToken,
+              <<"type">>          := _Type} = json:decode(Content),
+            refresh_grant(RefreshToken, ClientId, ClientSecret);
         _ ->
             %% doesn't exist or we don't have permissions. try instance metadata
             metadata_fetch_token(ServiceAccount)
@@ -77,34 +77,75 @@ get_config_path() ->
             Dir
     end.
 
+%%%-----------------------------------------------------------------------------
+%%% EXCHANGING THEM FOR AN ACCESS TOKEN
+%%%-----------------------------------------------------------------------------
+jwt_bearer_grant(Assertion) ->
+    Body = uri_string:compose_query([{<<"grant_type">>, ?JWT_GRANT_TYPE},
+                                     {<<"assertion">>, Assertion}]),
+    post_for_creds(augle_conf:auth_url(), Body).
+
+refresh_grant(RefreshToken, ClientId, ClientSecret) ->
+    Body = uri_string:compose_query([{<<"grant_type">>, ?REFRESH_GRANT_TYPE},
+                                     {<<"client_id">>, ClientId},
+                                     {<<"client_secret">>, ClientSecret},
+                                     {<<"refresh_token">>, RefreshToken}]),
+    post_for_creds(augle_conf:token_endpoint(), Body).
+
 metadata_fetch_token(ServiceAccount) ->
-    case hackney:get(?META_URL(ServiceAccount),
-                     ?META_HEADERS, <<>>,
-                     []) of
-        {ok, 200, _RespHeaders, Client} ->
-            {ok, Body} = hackney:body(Client),
-            {ok, augle_utils:decode_json(Body)};
-        {ok, _Status, _, Client} ->
-            {ok, Body} = hackney:body(Client),
-            {error, augle_utils:decode_json(Body)};
-        {error, Reason} ->
-            {error, Reason}
+    creds_response(nhttpc:get(metadata_url(ServiceAccount), #{headers => ?META_HEADERS})).
+
+post_for_creds(Url, Body) ->
+    Headers = [{<<"content-type">>, ?URLENCODED_CONTENT_TYPE}],
+    creds_response(nhttpc:post(Url, Body, #{headers => Headers})).
+
+metadata_url(ServiceAccount) ->
+    Host = augle_conf:metadata_host(),
+    <<Host/binary, "/computeMetadata/v1/instance/service-accounts/",
+      ServiceAccount/binary, "/token">>.
+
+%% Turns an `nhttpc' result into the public `augle:creds()' shape.
+%%
+%% Google answers every token endpoint with JSON, so a body we cannot parse
+%% means something else answered for it (a proxy, a captive portal) and is
+%% reported as an error rather than crashing the caller.
+-spec creds_response({ok, nhttp_lib:response()} | {error, term()}) ->
+          {ok, augle:creds()} | {error, term()}.
+creds_response({ok, #{status := 200} = Response}) ->
+    case decode_body(Response) of
+        {ok, Json} when is_map(Json) ->
+            {ok, creds(Json)};
+        {ok, Json} ->
+            {error, {unexpected_response, Json}};
+        {error, _} = Error ->
+            Error
+    end;
+creds_response({ok, Response}) ->
+    case decode_body(Response) of
+        {ok, Json} ->
+            {error, Json};
+        {error, _} = Error ->
+            Error
+    end;
+creds_response({error, Reason}) ->
+    {error, Reason}.
+
+decode_body(Response) ->
+    Body = iolist_to_binary(maps:get(body, Response, <<>>)),
+    try
+        {ok, json:decode(Body)}
+    catch
+        error:Reason ->
+            {error, {invalid_json, Reason}}
     end.
 
-refresh_grant(TokenUri, RefreshToken, ClientId, ClientSecret) ->
-    QS = [{<<"grant_type">>, ?REFRESH_GRANT_TYPE},
-          {<<"client_id">>, ClientId},
-          {<<"client_secret">>, ClientSecret},
-          {<<"refresh_token">>, RefreshToken}],
-    Body = hackney_url:qs(QS),
-    Headers = [{<<"content-type">>, ?URLENCODED_CONTENT_TYPE}],
-    case hackney:post(TokenUri, Headers, Body, []) of
-        {ok, 200, _RespHeaders, ClientRef} ->
-            {ok, Result} = hackney:body(ClientRef),
-            {ok, augle_utils:decode_json(Result)};
-        {ok, _Status, _, Client} ->
-            {ok, Body} = hackney:body(Client),
-            {error, augle_utils:decode_json(Body)};
-        {error, Reason} ->
-            {error, Reason}
-    end.
+%% Google's field names are strings on the wire. Map the ones that make up
+%% `augle:creds()' onto atoms explicitly, so no atom is created from a response.
+creds(Json) ->
+    maps:fold(fun to_creds_key/3, #{}, Json).
+
+to_creds_key(<<"access_token">>, Value, Acc) -> Acc#{access_token => Value};
+to_creds_key(<<"expires_in">>, Value, Acc)   -> Acc#{expires_in => Value};
+to_creds_key(<<"token_type">>, Value, Acc)   -> Acc#{token_type => Value};
+to_creds_key(<<"id_token">>, Value, Acc)     -> Acc#{id_token => Value};
+to_creds_key(_Key, _Value, Acc)              -> Acc.

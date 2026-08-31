@@ -24,7 +24,7 @@
 -define(SERVER, ?MODULE).
 -define(TOKEN_CACHE, token_ets_cache).
 
--record(state, {timers :: maps:map()}).
+-record(state, {timers :: map()}).
 
 start_link() ->
     case ets:info(?TOKEN_CACHE, name) of
@@ -38,7 +38,7 @@ start_link() ->
 add(CredsFrom, Creds) ->
     gen_server:cast(?SERVER, {add, CredsFrom, Creds}).
 
--spec get(augle:credentials_format()) -> augle:creds().
+-spec get(augle:credentials_format()) -> augle:creds() | notfound.
 get(Id) ->
     Now = erlang:monotonic_time(seconds),
     case ets:lookup(?TOKEN_CACHE, Id) of
