@@ -37,15 +37,9 @@
 
 -spec creds_from(credentials_format()) -> {ok, creds()} | {error, term()}.
 creds_from(CredsFrom) ->
-    case augle_token_store:get(CredsFrom) of
+    case augle_token_store:lookup(CredsFrom) of
         notfound ->
-            case new_creds_from(CredsFrom) of
-                {ok, Creds} ->
-                    augle_token_store:add(CredsFrom, Creds),
-                    {ok, Creds};
-                {error, Reason} ->
-                    {error, Reason}
-            end;
+            augle_token_store:fetch(CredsFrom);
         Creds ->
             {ok, Creds}
     end.

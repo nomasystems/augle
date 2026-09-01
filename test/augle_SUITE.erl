@@ -18,7 +18,11 @@ all() ->
      metadata_default,
      error_response_is_returned,
      unparseable_body_is_returned_as_error,
-     token_cache_refresh].
+     token_cache_refresh,
+     proactive_refresh_keeps_the_cache_warm,
+     concurrent_misses_fetch_once,
+     short_lived_token_does_not_crash,
+     broken_credentials_do_not_take_down_the_store].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(nhttp),
@@ -42,12 +46,15 @@ end_per_suite(Config) ->
 
 init_per_testcase(_, Config) ->
     ok = augle_test_google:reset(),
+    ok = augle_token_store:flush(),
     os:unsetenv("GOOGLE_APPLICATION_CREDENTIALS"),
     os:putenv("CLOUDSDK_CONFIG", ?EMPTY_CONFIG_DIR),
     Config.
 
 end_per_testcase(_, _Config) ->
     ok = augle_test_google:reset(),
+    ok = application:unset_env(augle, expiry_margin),
+    ok = application:unset_env(augle, refresh_margin),
     os:unsetenv("GOOGLE_APPLICATION_CREDENTIALS"),
     os:unsetenv("CLOUDSDK_CONFIG"),
     ok.
@@ -152,23 +159,83 @@ unparseable_body_is_returned_as_error(_Config) ->
     augle_test_google:respond_with({200, <<"<html>502 Bad Gateway</html>">>}),
     ?assertMatch({error, {invalid_json, _}}, augle:app_default_credentials()).
 
-%% The cache hands back a token until 10 seconds before it expires, then the
-%% store refreshes it on its own.
+%% Nothing scheduled a refresh (expires_in sits under refresh_margin), so this
+%% is the fallback: the token ages past its serve-until and the next caller
+%% fetches a fresh one.
 token_cache_refresh(_Config) ->
     augle_test_google:respond_with(fun(_Req) -> unique_token() end),
 
-    ?assertEqual(notfound, augle_token_store:get(default)),
+    ?assertEqual(notfound, augle_token_store:lookup(default)),
 
     {ok, #{access_token := Token1}} = augle:creds_from(default),
-    timer:sleep(1500),
+    %% still inside its life, so this one is served from the cache
+    ?assertMatch({ok, #{access_token := Token1}}, augle:creds_from(default)),
+    ?assertEqual(1, length(augle_test_google:requests())),
 
-    #{access_token := Token2} = augle_token_store:get(default),
+    %% expires_in is 11 and the margin is 10, so a second later it is spent
+    timer:sleep(1500),
+    ?assertEqual(notfound, augle_token_store:lookup(default)),
+
+    {ok, #{access_token := Token2}} = augle:creds_from(default),
     ?assertNotEqual(Token1, Token2),
+    ?assertEqual(2, length(augle_test_google:requests())).
 
-    timer:sleep(1500),
-    {ok, #{access_token := Token3}} = augle:creds_from(default),
-    ?assertNotEqual(Token1, Token3),
-    ?assertNotEqual(Token2, Token3).
+%% Under steady load the refresh lands before the token stops being served, so
+%% a reader never sees a miss and never waits on a token exchange.
+proactive_refresh_keeps_the_cache_warm(_Config) ->
+    ok = application:set_env(augle, expiry_margin, 1),
+    ok = application:set_env(augle, refresh_margin, 3),
+    %% 5s tokens: served until 4s, refreshed in the background at 2s
+    augle_test_google:respond_with(fun(_Req) -> unique_token(5) end),
+
+    {ok, #{access_token := Token1}} = augle:creds_from(default),
+    ?assertEqual(1, length(augle_test_google:requests())),
+
+    timer:sleep(2500),
+
+    %% a bare ETS read, so a new token here can only have come from the
+    %% background refresh, and the old one was still being served throughout
+    Token2 = maps:get(access_token, augle_token_store:lookup(default)),
+    ?assertNotEqual(Token1, Token2),
+    ?assertEqual(2, length(augle_test_google:requests())).
+
+%% A burst of callers arriving on a cold cache costs one request, not one each.
+concurrent_misses_fetch_once(_Config) ->
+    augle_test_google:respond_with(fun(_Req) -> unique_token() end),
+    CredsFrom = {metadata, <<"herd">>},
+
+    Parent = self(),
+    Pids = [spawn(fun() -> Parent ! {self(), augle:creds_from(CredsFrom)} end)
+            || _ <- lists:seq(1, 20)],
+    Results = [receive {Pid, Result} -> Result after 5000 -> timeout end || Pid <- Pids],
+
+    ?assertEqual(1, length(lists:usort(Results))),
+    ?assertMatch([{ok, #{access_token := _}}], lists:usort(Results)),
+    ?assertEqual(1, length(augle_test_google:requests())).
+
+%% expires_in below the expiry margin used to crash the store: the refresh timer
+%% was scheduled at expires_in - 10, and start_timer/3 rejects a negative time.
+short_lived_token_does_not_crash(_Config) ->
+    Store = whereis(augle_token_store),
+    augle_test_google:respond_with(token(<<"short">>, 5, <<"Bearer">>)),
+
+    ?assertMatch({ok, #{access_token := <<"short">>}}, augle:creds_from(default)),
+    %% never worth caching, but the store is still standing
+    ?assertEqual(notfound, augle_token_store:lookup(default)),
+    ?assertMatch({ok, #{access_token := <<"short">>}}, augle:creds_from(default)),
+    ?assertEqual(Store, whereis(augle_token_store)).
+
+%% A credential that blows up on the way out is the caller's problem, not the
+%% whole cache's: fetching runs in the shared server process now.
+broken_credentials_do_not_take_down_the_store(_Config) ->
+    Store = whereis(augle_token_store),
+
+    ?assertMatch({error, {credentials_error, error, {badmatch, {error, enoent}}, _}},
+                 augle:creds_from({file, "/does/not/exist.json"})),
+
+    ?assertEqual(Store, whereis(augle_token_store)),
+    augle_test_google:respond_with(token(<<"fine">>, 3600, <<"Bearer">>)),
+    ?assertMatch({ok, #{access_token := <<"fine">>}}, augle:creds_from(default)).
 
 %%%-----------------------------------------------------------------------------
 %%% HELPERS
@@ -182,9 +249,11 @@ token(AccessToken, ExpiresIn, TokenType) ->
       expires_in => ExpiresIn,
       token_type => TokenType}.
 
-%% expires_in of 11 makes the store schedule its refresh one second out
 unique_token() ->
+    unique_token(11).
+
+unique_token(ExpiresIn) ->
     Token = integer_to_binary(erlang:unique_integer([positive])),
     #{status => 200,
       headers => [{<<"content-type">>, <<"application/json">>}],
-      body => json:encode(token(Token, 11, <<"Bearer">>))}.
+      body => json:encode(token(Token, ExpiresIn, <<"Bearer">>))}.
