@@ -1,15 +1,14 @@
 %% -*- erlang -*-
 {application, augle,
  [{description, "Google service account access token handling"},
-  {vsn, "0.3.0"},
+  {vsn, "1.0.0"},
   {registered, []},
   {mod, {augle_app, []}},
   {start_phases, []},
   {applications, [kernel,
                   stdlib,
                   ssl,
-                  jsx,
-                  hackney]},
+                  nhttpc]},
   {env, []},
 
   {maintainers, ["Tristan Sloughter"]},
