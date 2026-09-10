@@ -22,6 +22,7 @@
 -define(CONFIG_DIR, "CLOUDSDK_CONFIG").
 
 -define(URLENCODED_CONTENT_TYPE, <<"application/x-www-form-urlencoded">>).
+-define(TLS_OPTS, #{wildcard_hostname => true}).
 -define(JWT_GRANT_TYPE, <<"urn:ietf:params:oauth:grant-type:jwt-bearer">>).
 -define(REFRESH_GRANT_TYPE, <<"refresh_token">>).
 
@@ -97,7 +98,7 @@ metadata_fetch_token(ServiceAccount) ->
 
 post_for_creds(Url, Body) ->
     Headers = [{<<"content-type">>, ?URLENCODED_CONTENT_TYPE}],
-    creds_response(nhttpc:post(Url, Body, #{headers => Headers})).
+    creds_response(nhttpc:post(Url, Body, #{headers => Headers, tls => ?TLS_OPTS})).
 
 metadata_url(ServiceAccount) ->
     Host = augle_conf:metadata_host(),
